@@ -80,7 +80,7 @@ var promMetrics = []promMetric{
 	{
 		name:      "fq_pop_empty_total",
 		kind:      "counter",
-		help:      "Total number of Pop calls that returned ErrEmpty.",
+		help:      "Total number of Pop or PopN calls that returned ErrEmpty.",
 		appendVal: func(b []byte, s QueueStats) []byte { return strconv.AppendUint(b, s.PopEmptyTotal, 10) },
 	},
 	{
@@ -152,13 +152,13 @@ var promMetrics = []promMetric{
 	{
 		name:      "fq_push_errors_total",
 		kind:      "counter",
-		help:      "Total number of failed Push calls.",
+		help:      "Total number of failed Push or PushN calls.",
 		appendVal: func(b []byte, s QueueStats) []byte { return strconv.AppendUint(b, s.PushErrorsTotal, 10) },
 	},
 	{
 		name:      "fq_pop_errors_total",
 		kind:      "counter",
-		help:      "Total number of failed Pop calls (excluding ErrEmpty).",
+		help:      "Total number of failed Pop or PopN calls (excluding ErrEmpty).",
 		appendVal: func(b []byte, s QueueStats) []byte { return strconv.AppendUint(b, s.PopErrorsTotal, 10) },
 	},
 	{

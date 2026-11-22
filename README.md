@@ -7,9 +7,10 @@
 - **Zero dependencies** — built solely on the Go standard library.
 - **Partitioned storage** — appends length-prefixed records into sequential partition files (`<name>.db<N>`, default 100 MiB) with automatic rollover and immediate deletion of consumed partitions.
 - **Bounded resources** — keeps at most 2 open file descriptors per queue (`O(1)`) regardless of backlog size.
-- **High throughput, minimal allocations** — `0 allocs/op` on `Push` (64 KiB reusable scratch buffer, zero-copy write path for larger payloads), 64 KiB read-ahead buffering on `Pop`, direct `[256]*queue` dispatch, and a dedicated metadata lock so background `fsync` never stalls `Push`/`Pop`.
+- **High throughput, minimal allocations** — `0 allocs/op` on `Push` and `PushN` (64 KiB reusable scratch buffer, zero-copy write path for larger payloads), 64 KiB read-ahead buffering on `Pop`/`PopN`, 32 KiB `mcache`-sized slab packing on `PopN`, direct `[256]*queue` dispatch, and a dedicated metadata lock so background `fsync` never stalls hot-path operations.
+- **Batch API (`PushN` & `PopN`)** — amortize mutex contention, syscalls, and GC allocations across batches while preserving strict FIFO order and partial-progress semantics on errors.
 - **Atomic metadata persistence** — queue cursors are persisted to `<name>.bin` via temp-file + `fsync` + atomic `rename` (`0o600` permissions).
-- **Concurrency-safe** — safe for concurrent `Push`, `Pop`, `Stats`, and `Close` calls across multiple goroutines within a single process.
+- **Concurrency-safe** — safe for concurrent `Push`, `PushN`, `Pop`, `PopN`, `Stats`, and `Close` calls across multiple goroutines within a single process.
 - **Prometheus-ready metrics** — `Stats() []QueueStats` snapshot API plus zero-dependency `WritePrometheus` v0.0.4 text exposition formatter.
 - **Pluggable logging** — accepts any `fq.Logger` (the standard library `*slog.Logger` satisfies it directly); silent by default when `nil`.
 - **Idiomatic constant errors** — exported sentinel errors are immutable `const` values of type `fq.Error` compatible with `errors.Is`.
@@ -122,6 +123,36 @@ func runConsumers(
 
 > **Ordering note**: Items are dequeued in strict FIFO order, but with `workers > 1` handlers execute concurrently. If strict end-to-end ordering is required for a stream, use `1` worker per `qID` (or shard keys across multiple `qID`s with 1 worker each).
 
+### Batch Operations (`PushN` & `PopN`)
+
+For high-throughput producers, multi-worker consumers, or downstream batching (bulk DB inserts, HTTP/gRPC flushes), use `PushN` and `PopN` to amortize lock contention, syscalls, and heap allocations:
+
+```go
+// Batch push: validates all items upfront, then writes up to 64 KiB chunks per syscall (0 allocs/op).
+pushed, err := q.PushN(ctx, queueEvents, [][]byte{
+	[]byte("event-1"),
+	[]byte("event-2"),
+	[]byte("event-3"),
+})
+if err != nil {
+	// pushed reflects any items committed before a mid-batch I/O error.
+	slog.Error("batch push failed", "pushed", pushed, "err", err)
+}
+
+// Batch pop: acquires the queue lock once and packs small payloads into 32 KiB slabs (append-safe 3-index slices).
+batch, err := q.PopN(ctx, queueEvents, 64)
+if len(batch) > 0 {
+	// Process batch even if err != nil (partial progress on mid-batch I/O error).
+	processBatch(batch)
+}
+if err != nil && !errors.Is(err, fq.ErrEmpty) {
+	slog.Error("batch pop failed", "err", err)
+}
+```
+
+- `PopN` returns fewer than `n` items with `err == nil` when the queue drains mid-batch; `fq.ErrEmpty` is returned only when **zero** items are available.
+- `PopN` packs small payloads into shared backing slabs (capped at 32 KiB) using 3-index slices (`cap == len`) so appending to one slice never mutates neighbors. If you retain a single element long-term beyond the batch lifecycle, copy it so the slab can be garbage collected.
+
 ## Configuration
 
 `fq.Params` supports camelCase YAML tags for config unmarshaling:
@@ -217,10 +248,10 @@ All exported errors are constants of type `fq.Error` with the `"fq: "` prefix an
 
 | Error | Description |
 | :--- | :--- |
-| `ErrEmpty` | Queue has no unread items (`Pop`). |
+| `ErrEmpty` | Queue has no unread items (`Pop`, or `PopN` when zero items are available). |
 | `ErrNil` | Referenced `qID` is not configured. |
 | `ErrClosed` | Operation called after `Close`. |
-| `ErrEmptyData` | Zero-length payload passed to `Push`. |
+| `ErrEmptyData` | Zero-length payload passed to `Push` or `PushN`. |
 | `ErrPayloadTooLarge` | Payload exceeds `16,777,215` bytes. |
 | `ErrInvalidConfig` | Invalid `Params` passed to `New`. |
 | `ErrInvalidMetadataSize` | Metadata file is not exactly 16 bytes. |
@@ -253,7 +284,7 @@ http.HandleFunc("/metrics", func(w http.ResponseWriter, _ *http.Request) {
 | `fq_pop_total` | Counter | Total records popped |
 | `fq_push_bytes_total` | Counter | Total payload bytes pushed |
 | `fq_pop_bytes_total` | Counter | Total payload bytes popped |
-| `fq_pop_empty_total` | Counter | `Pop` calls returning `ErrEmpty` |
+| `fq_pop_empty_total` | Counter | `Pop`/`PopN` calls returning `ErrEmpty` |
 | `fq_pending_bytes` | Gauge | Estimated unread bytes queued on disk |
 | `fq_pending_partitions` | Gauge | Unconsumed partitions behind active append partition |
 | `fq_append_file_index` / `fq_read_file_index` | Gauge | Active write and read partition indices |
@@ -262,12 +293,12 @@ http.HandleFunc("/metrics", func(w http.ResponseWriter, _ *http.Request) {
 | `fq_partitions_deleted_total` | Counter | Consumed/discarded partitions removed from disk |
 | `fq_read_cache_hits_total` / `fq_read_cache_misses_total` | Counter | 64 KiB read-ahead buffer hits and misses |
 | `fq_metadata_persists_total` / `fq_metadata_persist_errors_total` | Counter | Atomic metadata write successes and failures |
-| `fq_push_errors_total` / `fq_pop_errors_total` | Counter | Failed `Push` and `Pop` calls (excluding `ErrEmpty`) |
+| `fq_push_errors_total` / `fq_pop_errors_total` | Counter | Failed `Push`/`PushN` and `Pop`/`PopN` calls (excluding `ErrEmpty`) |
 | `fq_corruptions_total` | Counter | Corrupted partition records detected |
 
 ## Concurrency & Durability
 
-- **In-process concurrency**: All `FileQueue` methods (`Push`, `Pop`, `Stats`, `Close`) are safe for concurrent goroutines within a single process. `Close` is idempotent.
+- **In-process concurrency**: All `FileQueue` methods (`Push`, `PushN`, `Pop`, `PopN`, `Stats`, `Close`) are safe for concurrent goroutines within a single process. `Close` is idempotent.
 - **Single-process ownership**: `fq` does not acquire cross-process file locks (`flock`); do not open the same `Path` from multiple OS processes simultaneously.
 - **Durability model**: `Push` writes directly to the OS page cache without per-message `fsync`. Metadata cursors are flushed atomically every `PersistInterval` (default `1s`), and `Close` syncs open partition files and writes final metadata cleanly.
 
@@ -385,14 +416,19 @@ Measured on Apple M2 (`darwin/arm64`, Go 1.27.4, `go test -run='^$' -bench=. -be
 
 | Benchmark | Latency | Throughput | Memory | Allocs |
 | :--- | ---: | ---: | ---: | ---: |
-| `Push/64B` | `1180 ns/op` | `54.3 MB/s` | `0 B/op` | `0` |
-| `Push/1KiB` | `1681 ns/op` | `609 MB/s` | `0 B/op` | `0` |
-| `Push/128KiB` | `79.7 µs/op` | `1.65 GB/s` | `0 B/op` | `0` |
-| `Pop/64B` | `40.4 ns/op` | `1.58 GB/s` | `64 B/op` | `1` |
-| `Pop/1KiB` | `214.0 ns/op` | `4.78 GB/s` | `1024 B/op` | `1` |
-| `PushPop/64B` | `1596 ns/op` | `40.1 MB/s` | `64 B/op` | `1` |
-| `PushPop/1KiB` | `2325 ns/op` | `440 MB/s` | `1024 B/op` | `1` |
-| `PushPopParallel` | `2188 ns/op` | `29.3 MB/s` | `64 B/op` | `1` |
+| `Push/64B` | `1189 ns/op` | `53.8 MB/s` | `0 B/op` | `0` |
+| `Push/1KiB` | `1677 ns/op` | `611 MB/s` | `0 B/op` | `0` |
+| `Push/128KiB` | `66.5 µs/op` | `1.97 GB/s` | `0 B/op` | `0` |
+| `Pop/64B` | `40.7 ns/op` | `1.57 GB/s` | `64 B/op` | `1` |
+| `Pop/1KiB` | `208.1 ns/op` | `4.92 GB/s` | `1024 B/op` | `1` |
+| `PushPop/64B` | `1621 ns/op` | `39.5 MB/s` | `64 B/op` | `1` |
+| `PushPop/1KiB` | `2328 ns/op` | `440 MB/s` | `1024 B/op` | `1` |
+| `PushPopParallel` (`64B`) | `2192 ns/op` | `29.2 MB/s` | `64 B/op` | `1` |
+| `PushN/64B_x64` (`64 items`) | `3444 ns/op` (`53.8 ns/item`) | `1.19 GB/s` | `0 B/op` | `0` |
+| `PushN/1KiB_x64` (`64 items`) | `26.6 µs/op` (`416 ns/item`) | `2.46 GB/s` | `5 B/op` | `0` |
+| `PopN/64B_x64` (`64 items`) | `2105 ns/op` (`32.9 ns/item`) | `1.95 GB/s` | `5888 B/op` | `2` |
+| `PopN/1KiB_x64` (`64 items`) | `18.1 µs/op` (`282 ns/item`) | `3.63 GB/s` | `67332 B/op` | `3` |
+| `PushNPopNParallel` (`64B × 64`) | `7523 ns/op` (`118 ns/item`) | `544 MB/s` | `5890 B/op` | `2` |
 
 ## Development
 

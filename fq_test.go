@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1952,5 +1953,433 @@ func TestWriteFileAtomic_ErrorPaths(t *testing.T) {
 				t.Fatalf("writeTempAndRename(%s) expected temp file to be closed", tc.name)
 			}
 		})
+	}
+}
+
+func TestPushNPopN_BasicPartialAndSlabIsolation(t *testing.T) {
+	ctx := context.Background()
+	s := newTestFileQueue(t, t.TempDir(), QueueConfig{ID: 1, Name: "batch"})
+	defer s.Close(ctx)
+
+	// Empty PushN and non-positive PopN are clean no-ops on an open queue.
+	if n, err := s.PushN(ctx, 1, nil); err != nil || n != 0 {
+		t.Fatalf("PushN(nil) = (%d, %v), want (0, nil)", n, err)
+	}
+	if items, err := s.PopN(ctx, 1, 0); err != nil || items != nil {
+		t.Fatalf("PopN(0) = (%v, %v), want (nil, nil)", items, err)
+	}
+	if items, err := s.PopN(ctx, 1, -5); err != nil || items != nil {
+		t.Fatalf("PopN(-5) = (%v, %v), want (nil, nil)", items, err)
+	}
+
+	// PopN on empty queue returns ErrEmpty and increments PopEmptyTotal.
+	if items, err := s.PopN(ctx, 1, 10); !errors.Is(err, ErrEmpty) || items != nil {
+		t.Fatalf("PopN on empty = (%v, %v), want (nil, %v)", items, err, ErrEmpty)
+	} else {
+		assertFQErrPrefix(t, err)
+	}
+
+	const total = 100
+	input := make([][]byte, total)
+	for i := range total {
+		input[i] = fmt.Appendf(nil, "msg-%04d", i)
+	}
+
+	if n, err := s.PushN(ctx, 1, input); err != nil || n != total {
+		t.Fatalf("PushN(%d) = (%d, %v), want (%d, nil)", total, n, err, total)
+	}
+
+	// PopN(1) exercises single-item allocation path.
+	single, err := s.PopN(ctx, 1, 1)
+	if err != nil || len(single) != 1 || string(single[0]) != "msg-0000" {
+		t.Fatalf("PopN(1) = (%q, %v), want ([msg-0000], nil)", single, err)
+	}
+
+	// PopN(64) returns exact FIFO order and 3-index append-isolated slices.
+	batch, err := s.PopN(ctx, 1, 64)
+	if err != nil || len(batch) != 64 {
+		t.Fatalf("PopN(64) = (len=%d, %v), want (64, nil)", len(batch), err)
+	}
+	for i, got := range batch {
+		want := fmt.Sprintf("msg-%04d", i+1)
+		if string(got) != want {
+			t.Fatalf("batch[%d] = %q, want %q", i, got, want)
+		}
+		if cap(got) != len(got) {
+			t.Fatalf("batch[%d] cap=%d, want len=%d (3-index isolation)", i, cap(got), len(got))
+		}
+	}
+	// Appending to batch[0] must allocate a new backing array and never mutate batch[1].
+	batch[0] = append(batch[0], []byte("MUTATED")...)
+	if string(batch[1]) != "msg-0002" {
+		t.Fatalf("appending to batch[0] mutated batch[1]: got %q, want %q", batch[1], "msg-0002")
+	}
+
+	// Partial PopN with huge n returns remaining 35 items with nil error and no OOM.
+	rest, err := s.PopN(ctx, 1, 1_000_000)
+	if err != nil || len(rest) != 35 {
+		t.Fatalf("PopN(1_000_000) = (len=%d, %v), want (35, nil)", len(rest), err)
+	}
+	for i, got := range rest {
+		want := fmt.Sprintf("msg-%04d", i+65)
+		if string(got) != want {
+			t.Fatalf("rest[%d] = %q, want %q", i, got, want)
+		}
+	}
+
+	// Queue is now empty again; PopEmptyTotal was only incremented by empty calls (1 before, 1 now).
+	if _, err := s.PopN(ctx, 1, 8); !errors.Is(err, ErrEmpty) {
+		t.Fatalf("expected ErrEmpty after drain, got %v", err)
+	}
+	st := s.Stats()[0]
+	if st.PushTotal != total || st.PopTotal != total || st.PopEmptyTotal != 2 {
+		t.Fatalf("unexpected stats after batch drain: %+v", st)
+	}
+}
+
+func TestPushNPopN_MultiChunkLargePayloadsAndRollover(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+
+	s, err := New(Params{
+		Path:        dir,
+		MaxFileSize: minFileSize,
+		Queues:      []QueueConfig{{ID: 1, Name: "roll"}},
+	})
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+
+	// Build a batch mixing small items (spanning > maxWriteBufSize chunks),
+	// large items (> maxWriteBufSize zero-copy path), and enough data to cross
+	// multiple 1 MiB partition rollovers.
+	var want [][]byte
+	for i := range 120 {
+		want = append(want, bytes.Repeat([]byte{byte('a' + i%26)}, 1024))
+	}
+	// Large payload (> maxWriteBufSize) between small items.
+	largeA := bytes.Repeat([]byte("L"), maxWriteBufSize+4096)
+	largeB := bytes.Repeat([]byte("M"), minFileSize) // triggers immediate rollover on a single large item
+	want = append(want, []byte("before-large"), largeA, []byte("after-large"), largeB)
+	// Add > popBatchInitCap (300) small items spanning another rollover.
+	for i := range 300 {
+		p := bytes.Repeat([]byte{byte('0' + i%10)}, 4096)
+		want = append(want, p)
+	}
+
+	pushed, err := s.PushN(ctx, 1, want)
+	if err != nil || pushed != len(want) {
+		t.Fatalf("PushN(%d) = (%d, %v)", len(want), pushed, err)
+	}
+
+	// Close and reopen to verify persistence of batch-written partitions.
+	s.Close(ctx)
+
+	s, err = New(Params{
+		Path:        dir,
+		MaxFileSize: minFileSize,
+		Queues:      []QueueConfig{{ID: 1, Name: "roll"}},
+	})
+	if err != nil {
+		t.Fatalf("reopen New failed: %v", err)
+	}
+	defer s.Close(ctx)
+
+	// Drain everything in one large PopN (exceeding popBatchInitCap and crossing multiple partitions).
+	got, err := s.PopN(ctx, 1, len(want)+50)
+	if err != nil {
+		t.Fatalf("PopN across rollovers failed: %v", err)
+	}
+	if len(got) != len(want) {
+		t.Fatalf("PopN returned %d items, want %d", len(got), len(want))
+	}
+	for i := range want {
+		if !bytes.Equal(got[i], want[i]) {
+			t.Fatalf("item %d mismatch: got len %d, want len %d", i, len(got[i]), len(want[i]))
+		}
+	}
+
+	st := s.Stats()[0]
+	if st.PartitionsDeletedTotal == 0 {
+		t.Fatalf("expected consumed partitions to be deleted, stats=%+v", st)
+	}
+}
+
+func TestPushNPopN_ValidationAndIOErrors(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("validation, unknown queue, canceled context, and closed queue", func(t *testing.T) {
+		s := newTestFileQueue(t, t.TempDir(), QueueConfig{ID: 1, Name: "q"})
+
+		// Canceled context on known and unknown queues.
+		canceled, cancel := context.WithCancel(ctx)
+		cancel()
+		if n, err := s.PushN(canceled, 1, [][]byte{[]byte("x")}); !errors.Is(err, context.Canceled) || n != 0 {
+			t.Fatalf("PushN canceled = (%d, %v), want (0, context.Canceled)", n, err)
+		} else {
+			assertFQErrPrefix(t, err)
+		}
+		if _, err := s.PushN(canceled, 99, [][]byte{[]byte("x")}); !errors.Is(err, context.Canceled) {
+			t.Fatalf("PushN canceled unknown = %v, want context.Canceled", err)
+		}
+		if items, err := s.PopN(canceled, 1, 5); !errors.Is(err, context.Canceled) || items != nil {
+			t.Fatalf("PopN canceled = (%v, %v), want (nil, context.Canceled)", items, err)
+		} else {
+			assertFQErrPrefix(t, err)
+		}
+		if _, err := s.PopN(canceled, 99, 5); !errors.Is(err, context.Canceled) {
+			t.Fatalf("PopN canceled unknown = %v, want context.Canceled", err)
+		}
+
+		// Unknown queue ID.
+		if n, err := s.PushN(ctx, 99, [][]byte{[]byte("x")}); !errors.Is(err, ErrNil) || n != 0 {
+			t.Fatalf("PushN unknown = (%d, %v), want (0, ErrNil)", n, err)
+		} else {
+			assertFQErrPrefix(t, err)
+		}
+		if items, err := s.PopN(ctx, 99, 5); !errors.Is(err, ErrNil) || items != nil {
+			t.Fatalf("PopN unknown = (%v, %v), want (nil, ErrNil)", items, err)
+		} else {
+			assertFQErrPrefix(t, err)
+		}
+
+		// All-or-nothing upfront validation: invalid item at index 1 must NOT write item 0.
+		if n, err := s.PushN(ctx, 1, [][]byte{[]byte("ok"), {}}); !errors.Is(err, ErrEmptyData) || n != 0 {
+			t.Fatalf("PushN empty item = (%d, %v), want (0, ErrEmptyData)", n, err)
+		} else {
+			assertFQErrPrefix(t, err)
+		}
+		huge := make([]byte, maxPayloadSize+1)
+		if n, err := s.PushN(ctx, 1, [][]byte{[]byte("ok"), huge}); !errors.Is(err, ErrPayloadTooLarge) || n != 0 {
+			t.Fatalf("PushN huge item = (%d, %v), want (0, ErrPayloadTooLarge)", n, err)
+		} else {
+			assertFQErrPrefix(t, err)
+		}
+		if _, err := s.Pop(ctx, 1); !errors.Is(err, ErrEmpty) {
+			t.Fatalf("expected queue to remain empty after rejected PushN, got %v", err)
+		}
+
+		// Closed queue rejects PushN/PopN (even with empty items or n <= 0).
+		s.Close(ctx)
+		if n, err := s.PushN(ctx, 1, nil); !errors.Is(err, ErrClosed) || n != 0 {
+			t.Fatalf("PushN after Close = (%d, %v), want (0, ErrClosed)", n, err)
+		} else {
+			assertFQErrPrefix(t, err)
+		}
+		if items, err := s.PopN(ctx, 1, 0); !errors.Is(err, ErrClosed) || items != nil {
+			t.Fatalf("PopN after Close = (%v, %v), want (nil, ErrClosed)", items, err)
+		} else {
+			assertFQErrPrefix(t, err)
+		}
+	})
+
+	t.Run("PushN ensureAppendFM error", func(t *testing.T) {
+		dir := t.TempDir()
+		s := newTestFileQueue(t, dir, QueueConfig{ID: 1, Name: "q"}).(*fileQueue)
+		defer s.Close(ctx)
+
+		q := s.queues[1]
+		q.mu.Lock()
+		_ = q.appendFM.Close()
+		q.appendFM = nil
+		q.readFM = nil
+		q.mu.Unlock()
+
+		db0 := filepath.Join(dir, "q.db0")
+		_ = os.Remove(db0)
+		if err := os.Mkdir(db0, 0o755); err != nil {
+			t.Fatalf("Mkdir failed: %v", err)
+		}
+
+		n, err := s.PushN(ctx, 1, [][]byte{[]byte("a")})
+		if err == nil || n != 0 {
+			t.Fatalf("PushN ensureAppendFM = (%d, %v), want (0, error)", n, err)
+		}
+		assertFQErrPrefix(t, err)
+	})
+
+	t.Run("PushN partial commit on rollover partition creation error", func(t *testing.T) {
+		dir := t.TempDir()
+		s, err := New(Params{
+			Path:        dir,
+			MaxFileSize: minFileSize,
+			Queues:      []QueueConfig{{ID: 1, Name: "q"}},
+		})
+		if err != nil {
+			t.Fatalf("New failed: %v", err)
+		}
+		defer s.Close(ctx)
+
+		// Block q.db1 so the rollover chunk fails while the earlier chunk succeeds.
+		if err := os.Mkdir(filepath.Join(dir, "q.db1"), 0o755); err != nil {
+			t.Fatalf("Mkdir failed: %v", err)
+		}
+
+		items := [][]byte{
+			[]byte("first-committed"),
+			bytes.Repeat([]byte("r"), minFileSize), // separate chunk triggering rollover to blocked q.db1
+		}
+		n, err := s.PushN(ctx, 1, items)
+		if err == nil || n != 1 {
+			t.Fatalf("PushN partial rollover error = (%d, %v), want (1, error)", n, err)
+		}
+		assertFQErrPrefix(t, err)
+
+		got, err := s.Pop(ctx, 1)
+		if err != nil || string(got) != "first-committed" {
+			t.Fatalf("Pop committed item = (%q, %v), want (%q, nil)", got, err, "first-committed")
+		}
+	})
+
+	t.Run("PushN write failure during rollover cleans up created partition", func(t *testing.T) {
+		dir := t.TempDir()
+		s, err := New(Params{
+			Path:        dir,
+			MaxFileSize: minFileSize,
+			Queues:      []QueueConfig{{ID: 1, Name: "q"}},
+		})
+		if err != nil {
+			t.Fatalf("New failed: %v", err)
+		}
+		defer s.Close(ctx)
+
+		q := s.(*fileQueue).queues[1]
+		q.mu.Lock()
+		stub := &stubFileStore{fileStore: q.appendFM, writeErr: errors.New("disk full")}
+		q.appendFM = stub
+		q.readFM = stub
+		q.mu.Unlock()
+
+		n, err := s.PushN(ctx, 1, [][]byte{bytes.Repeat([]byte("r"), minFileSize)})
+		if err == nil || n != 0 {
+			t.Fatalf("PushN write error = (%d, %v), want (0, error)", n, err)
+		}
+		assertFQErrPrefix(t, err)
+
+		if _, statErr := os.Stat(filepath.Join(dir, "q.db1")); !errors.Is(statErr, os.ErrNotExist) {
+			t.Fatalf("expected rollover partition q.db1 cleanup, stat err = %v", statErr)
+		}
+	})
+
+	t.Run("PopN returns already-popped items alongside mid-batch I/O error", func(t *testing.T) {
+		s := newTestFileQueue(t, t.TempDir(), QueueConfig{ID: 1, Name: "q"}).(*fileQueue)
+		defer s.Close(ctx)
+
+		large := bytes.Repeat([]byte("P"), readAheadBufSize+100)
+		if _, err := s.PushN(ctx, 1, [][]byte{[]byte("ok-first"), large}); err != nil {
+			t.Fatalf("PushN failed: %v", err)
+		}
+
+		// ReadAt #1 fills readBuf (serves item 0 header+payload AND item 1 header);
+		// ReadAt #2 reads item 1's large payload directly and fails.
+		q := s.queues[1]
+		q.mu.Lock()
+		stub := &stubFileStore{
+			fileStore: q.readFM,
+			readSeq:   []error{nil, errors.New("payload io error")},
+		}
+		q.readFM = stub
+		q.appendFM = stub
+		q.mu.Unlock()
+
+		got, err := s.PopN(ctx, 1, 2)
+		if !errors.Is(err, ErrFileRead) {
+			t.Fatalf("PopN mid-batch err = %v, want %v", err, ErrFileRead)
+		}
+		assertFQErrPrefix(t, err)
+		if len(got) != 1 || string(got[0]) != "ok-first" {
+			t.Fatalf("PopN partial items = %q, want [%q]", got, "ok-first")
+		}
+	})
+}
+
+func TestPushNPopN_ConcurrentStress(t *testing.T) {
+	ctx := context.Background()
+	s, err := New(Params{
+		Path:            t.TempDir(),
+		MaxFileSize:     minFileSize,
+		PersistInterval: 10 * time.Millisecond,
+		Queues:          []QueueConfig{{ID: 1, Name: "stress-batch"}},
+	})
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+	defer s.Close(ctx)
+
+	const (
+		producers   = 4
+		consumers   = 4
+		batchesEach = 30
+		batchSize   = 25
+		totalMsgs   = producers * batchesEach * batchSize
+	)
+
+	var (
+		prodWG   sync.WaitGroup
+		consWG   sync.WaitGroup
+		seenMu   sync.Mutex
+		seen     = make(map[string]int, totalMsgs)
+		consumed atomic.Int64
+	)
+
+	for p := range producers {
+		prodWG.Go(func() {
+			for b := range batchesEach {
+				items := make([][]byte, batchSize)
+				for i := range batchSize {
+					items[i] = fmt.Appendf(nil, "p%d-b%d-i%d", p, b, i)
+				}
+				if n, err := s.PushN(ctx, 1, items); err != nil || n != batchSize {
+					t.Errorf("PushN failed: n=%d err=%v", n, err)
+					return
+				}
+			}
+		})
+	}
+
+	doneProducing := make(chan struct{})
+	go func() {
+		prodWG.Wait()
+		close(doneProducing)
+	}()
+
+	for range consumers {
+		consWG.Go(func() {
+			for {
+				items, err := s.PopN(ctx, 1, 16)
+				if err == nil {
+					seenMu.Lock()
+					for _, data := range items {
+						seen[string(data)]++
+					}
+					seenMu.Unlock()
+					consumed.Add(int64(len(items)))
+					continue
+				}
+				if !errors.Is(err, ErrEmpty) {
+					t.Errorf("PopN error: %v", err)
+					return
+				}
+				select {
+				case <-doneProducing:
+					if consumed.Load() >= totalMsgs {
+						return
+					}
+				default:
+					runtime.Gosched()
+				}
+			}
+		})
+	}
+
+	consWG.Wait()
+
+	if len(seen) != totalMsgs {
+		t.Fatalf("consumed %d unique messages, want %d", len(seen), totalMsgs)
+	}
+	for msg, count := range seen {
+		if count != 1 {
+			t.Fatalf("message %q delivered %d times, want 1", msg, count)
+		}
 	}
 }

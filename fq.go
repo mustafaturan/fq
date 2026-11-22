@@ -46,6 +46,14 @@ const (
 	// readAheadBufSize is the size of the per-queue read-ahead buffer (64 KiB).
 	readAheadBufSize = 64 * 1024
 
+	// maxPopSlabSize caps per-slab allocations in PopN at 32 KiB (Go's per-P mcache
+	// small-object ceiling) to avoid global mheap span locking on batch pops.
+	maxPopSlabSize = 32 * 1024
+
+	// popBatchInitCap bounds initial slice pre-allocation in PopN so very large n
+	// values do not over-allocate when fewer items exist.
+	popBatchInitCap = 256
+
 	// metadataSize is the fixed byte length of the serialized queue metadata (4 x uint32).
 	metadataSize = 16
 
@@ -104,7 +112,9 @@ type Logger interface {
 // FileQueue defines the operations for pushing to, popping from, inspecting, and closing queues.
 type FileQueue interface {
 	Push(ctx context.Context, qID uint8, data []byte) error
+	PushN(ctx context.Context, qID uint8, items [][]byte) (int, error)
 	Pop(ctx context.Context, qID uint8) ([]byte, error)
+	PopN(ctx context.Context, qID uint8, n int) ([][]byte, error)
 	Stats() []QueueStats
 	Close(ctx context.Context)
 }
@@ -418,6 +428,134 @@ func (f *fileQueue) Push(ctx context.Context, qID uint8, data []byte) error {
 		return nil
 	}
 
+	f.commitAppendRollover(qID, q, appendFM, nextFM, nextIndex, nextOffset)
+	return nil
+}
+
+// PushN appends items in FIFO order to the queue identified by qID, batching
+// contiguous records up to maxWriteBufSize into single partition writes under
+// one lock acquisition. All items are validated upfront before writing.
+//
+// PushN returns the number of items written and any error encountered. When an
+// I/O error occurs mid-batch across chunks or partition rollovers, the returned
+// count reflects items already committed to the queue. An empty items slice on
+// an open, valid queue returns (0, nil).
+func (f *fileQueue) PushN(ctx context.Context, qID uint8, items [][]byte) (int, error) {
+	q := f.queues[qID]
+	if err := ctx.Err(); err != nil {
+		if q != nil {
+			q.pushErrorsTotal.Add(1)
+		}
+		return 0, fmt.Errorf("fq: push canceled: %w", err)
+	}
+	if q == nil {
+		return 0, ErrNil
+	}
+	for i, data := range items {
+		if len(data) == 0 {
+			q.pushErrorsTotal.Add(1)
+			return 0, fmt.Errorf("%w: item %d", ErrEmptyData, i)
+		}
+		if len(data) > maxPayloadSize {
+			q.pushErrorsTotal.Add(1)
+			return 0, fmt.Errorf("%w: item %d got %d bytes, max %d", ErrPayloadTooLarge, i, len(data), maxPayloadSize)
+		}
+	}
+
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	if q.closed {
+		q.pushErrorsTotal.Add(1)
+		return 0, ErrClosed
+	}
+	if len(items) == 0 {
+		return 0, nil
+	}
+
+	if _, err := f.ensureAppendFM(q); err != nil {
+		q.pushErrorsTotal.Add(1)
+		return 0, err
+	}
+
+	pushed := 0
+	for pushed < len(items) {
+		appendFM := q.appendFM
+		start := pushed
+		endOffset := int64(q.AppendOffset)
+		chunkBytes := 0
+		chunkPayloadBytes := uint64(0)
+		willRollover := false
+
+		for pushed < len(items) {
+			itemLen := cfgSizeHeaderBytes + len(items[pushed])
+			if chunkBytes == 0 && itemLen > maxWriteBufSize {
+				endOffset += int64(itemLen)
+				chunkBytes = itemLen
+				chunkPayloadBytes = uint64(len(items[pushed]))
+				pushed++
+				willRollover = endOffset+cfgSizeHeaderBytes > f.maxFileSize
+				break
+			}
+			if chunkBytes > 0 && chunkBytes+itemLen > maxWriteBufSize {
+				break
+			}
+			chunkBytes += itemLen
+			endOffset += int64(itemLen)
+			chunkPayloadBytes += uint64(len(items[pushed]))
+			pushed++
+			if endOffset+cfgSizeHeaderBytes > f.maxFileSize {
+				willRollover = true
+				break
+			}
+		}
+
+		var (
+			nextIndex = q.AppendFileIndex + 1
+			nextFM    fileStore
+			err       error
+		)
+		if willRollover {
+			nextPath := partitionFilePath(f.path, q.name, nextIndex)
+			nextFM, err = fm.New(nextPath, f.maxFileSize)
+			if err != nil {
+				q.pushErrorsTotal.Add(1)
+				return start, fmt.Errorf("fq: failed creating partition %q: %w", nextPath, err)
+			}
+		}
+
+		batch := items[start:pushed]
+		if len(batch) == 1 && chunkBytes > maxWriteBufSize {
+			err = q.writeRecord(appendFM, int64(q.AppendOffset), batch[0])
+		} else {
+			err = q.writeBatch(appendFM, int64(q.AppendOffset), batch, chunkBytes)
+		}
+		if err != nil {
+			if nextFM != nil {
+				_ = nextFM.Close()
+				_ = os.Remove(nextFM.Path())
+			}
+			q.pushErrorsTotal.Add(1)
+			return start, fmt.Errorf("fq: failed appending to file: %w", err)
+		}
+
+		q.pushTotal += uint64(len(batch))
+		q.pushBytesTotal += chunkPayloadBytes
+
+		if !willRollover {
+			q.AppendOffset = int32(endOffset)
+			continue
+		}
+
+		f.commitAppendRollover(qID, q, appendFM, nextFM, nextIndex, endOffset)
+	}
+
+	return pushed, nil
+}
+
+// commitAppendRollover advances q to nextFM at nextIndex and closes oldFM when
+// it is no longer needed for reading. Caller must hold q.mu.
+func (f *fileQueue) commitAppendRollover(qID uint8, q *queue, oldFM, nextFM fileStore, nextIndex int32, writtenEnd int64) {
 	oldIndex := q.AppendFileIndex
 	q.AppendFileIndex = nextIndex
 	q.AppendOffset = 0
@@ -431,18 +569,16 @@ func (f *fileQueue) Push(ctx context.Context, qID uint8, data []byte) error {
 		"ro", q.ReadOffset,
 		"afi", q.AppendFileIndex,
 		"ao", q.AppendOffset,
-		"total", nextOffset,
+		"total", writtenEnd,
 		"max", f.maxFileSize,
 	)
 
 	// Close intermediate partitions that are neither being written nor read to keep FDs O(1).
 	if oldIndex != q.ReadFileIndex {
-		if err := appendFM.Close(); err != nil {
+		if err := oldFM.Close(); err != nil {
 			f.logger.Error("failed closing rolled partition", "queue", q.name, "index", oldIndex, "err", err)
 		}
 	}
-
-	return nil
 }
 
 // Pop removes and returns the next item in FIFO order from the queue identified by qID.
@@ -469,17 +605,96 @@ func (f *fileQueue) Pop(ctx context.Context, qID uint8) ([]byte, error) {
 		return nil, ErrClosed
 	}
 
+	data, _, err := f.popOne(qID, q, nil, 1)
+	if errors.Is(err, ErrEmpty) {
+		q.popEmptyTotal++
+		return nil, ErrEmpty
+	}
+	return data, err
+}
+
+// PopN removes and returns up to n items in FIFO order from the queue identified
+// by qID under a single lock acquisition. Small payloads are packed into shared
+// backing slabs using 3-index sub-slices (append-safe, reducing GC allocations).
+//
+// If fewer than n items are available (and at least one is popped), PopN returns
+// those items with a nil error. ErrEmpty is returned only when zero items are
+// available. If an I/O or corruption error occurs after one or more items have
+// been popped, PopN returns the popped items alongside the error. If n <= 0 on
+// an open, valid queue, PopN returns (nil, nil).
+func (f *fileQueue) PopN(ctx context.Context, qID uint8, n int) ([][]byte, error) {
+	q := f.queues[qID]
+	if err := ctx.Err(); err != nil {
+		if q != nil {
+			q.popErrorsTotal.Add(1)
+		}
+		return nil, fmt.Errorf("fq: pop canceled: %w", err)
+	}
+	if q == nil {
+		f.logger.Error(ErrNil.Error(), "qID", qID)
+		return nil, ErrNil
+	}
+
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	if q.closed {
+		q.popErrorsTotal.Add(1)
+		f.logger.Error(ErrClosed.Error(), "qID", qID)
+		return nil, ErrClosed
+	}
+	if n <= 0 {
+		return nil, nil
+	}
+
+	var (
+		items [][]byte
+		slab  []byte
+	)
+	for len(items) < n {
+		var (
+			data []byte
+			err  error
+		)
+		data, slab, err = f.popOne(qID, q, slab, n-len(items))
+		if err != nil {
+			if errors.Is(err, ErrEmpty) {
+				if len(items) == 0 {
+					q.popEmptyTotal++
+					return nil, ErrEmpty
+				}
+				return items, nil
+			}
+			return items, err
+		}
+		if items == nil {
+			initCap := min(n, popBatchInitCap)
+			if q.ReadFileIndex == q.AppendFileIndex {
+				if avail := int(q.AppendOffset-q.ReadOffset)/(cfgSizeHeaderBytes+1) + 1; avail < initCap {
+					initCap = avail
+				}
+			}
+			items = make([][]byte, 0, initCap)
+		}
+		items = append(items, data)
+	}
+	return items, nil
+}
+
+// popOne removes and returns a single item from q. Caller must hold q.mu.
+// It does not increment q.popEmptyTotal on ErrEmpty so PopN can distinguish
+// an empty queue from a partial batch drain.
+func (f *fileQueue) popOne(qID uint8, q *queue, slab []byte, remaining int) ([]byte, []byte, error) {
 	for {
 		if q.ReadFileIndex > q.AppendFileIndex || (q.ReadFileIndex == q.AppendFileIndex && q.ReadOffset >= q.AppendOffset) {
-			q.popEmptyTotal++
-			return nil, ErrEmpty
+			return nil, slab, ErrEmpty
 		}
 
 		// Advance to the next partition when no header can fit in the remaining tail.
 		if int64(q.ReadOffset)+cfgSizeHeaderBytes > f.maxFileSize {
 			if err := f.advanceReadPartition(qID, q); err != nil {
 				q.popErrorsTotal.Add(1)
-				return nil, err
+				return nil, slab, err
 			}
 			continue
 		}
@@ -487,39 +702,59 @@ func (f *fileQueue) Pop(ctx context.Context, qID uint8) ([]byte, error) {
 		readFM, err := f.ensureReadFM(q)
 		if err != nil {
 			q.popErrorsTotal.Add(1)
-			return nil, err
+			return nil, slab, err
 		}
 
 		if err := q.readBytes(readFM, q.ReadOffset, q.hdrBuf[:]); err != nil {
 			q.popErrorsTotal.Add(1)
-			return nil, fmt.Errorf("%w: reading size header: %w", ErrFileRead, err)
+			return nil, slab, fmt.Errorf("%w: reading size header: %w", ErrFileRead, err)
 		}
 
 		size := uint24(q.hdrBuf[:])
 		if size == 0 {
 			q.corruptionsTotal++
 			q.popErrorsTotal.Add(1)
-			return nil, f.selfHealCorruptedPartition(qID, q)
+			return nil, slab, f.selfHealCorruptedPartition(qID, q)
 		}
 
 		nextOffset := int64(q.ReadOffset) + cfgSizeHeaderBytes + int64(size)
 		if q.ReadFileIndex == q.AppendFileIndex && nextOffset > int64(q.AppendOffset) {
 			q.corruptionsTotal++
 			q.popErrorsTotal.Add(1)
-			return nil, fmt.Errorf("%w: record size %d at offset %d exceeds append offset %d", ErrCorrupted, size, q.ReadOffset, q.AppendOffset)
+			return nil, slab, fmt.Errorf("%w: record size %d at offset %d exceeds append offset %d", ErrCorrupted, size, q.ReadOffset, q.AppendOffset)
 		}
 
-		data := make([]byte, size)
+		var data []byte
+		data, slab = q.allocPopPayload(slab, int(size), remaining)
 		if err := q.readBytes(readFM, q.ReadOffset+cfgSizeHeaderBytes, data); err != nil {
 			q.popErrorsTotal.Add(1)
-			return nil, fmt.Errorf("%w: reading payload: %w", ErrFileRead, err)
+			return nil, slab, fmt.Errorf("%w: reading payload: %w", ErrFileRead, err)
 		}
 
 		q.ReadOffset = int32(nextOffset)
 		q.popTotal++
 		q.popBytesTotal += uint64(size)
-		return data, nil
+		return data, slab, nil
 	}
+}
+
+func (q *queue) allocPopPayload(slab []byte, size, remaining int) ([]byte, []byte) {
+	if len(slab) >= size {
+		return slab[:size:size], slab[size:]
+	}
+	if remaining == 1 || size >= maxPopSlabSize {
+		return make([]byte, size), slab
+	}
+
+	slabSize := min(remaining, maxPopSlabSize/size) * size
+	if q.ReadFileIndex == q.AppendFileIndex {
+		if avail := int(q.AppendOffset-q.ReadOffset) - cfgSizeHeaderBytes; avail < slabSize {
+			slabSize = avail
+		}
+	}
+
+	slab = make([]byte, slabSize)
+	return slab[:size:size], slab[size:]
 }
 
 // Stats returns a point-in-time metrics snapshot for every configured queue,
@@ -849,6 +1084,23 @@ func (q *queue) writeRecord(store fileStore, offset int64, data []byte) error {
 	}
 	putUint24(q.hdrBuf[:], int32(len(data)))
 	_, err := store.WriteAt(q.hdrBuf[:], offset)
+	return err
+}
+
+// writeBatch frames items contiguously into q.writeBuf and writes them in a
+// single WriteAt call. Caller must hold q.mu and ensure totalBytes <= maxWriteBufSize.
+func (q *queue) writeBatch(store fileStore, offset int64, items [][]byte, totalBytes int) error {
+	if cap(q.writeBuf) < totalBytes {
+		q.writeBuf = make([]byte, totalBytes)
+	}
+	buf := q.writeBuf[:totalBytes]
+	pos := 0
+	for _, data := range items {
+		putUint24(buf[pos:pos+cfgSizeHeaderBytes], int32(len(data)))
+		pos += cfgSizeHeaderBytes
+		pos += copy(buf[pos:], data)
+	}
+	_, err := store.WriteAt(buf, offset)
 	return err
 }
 

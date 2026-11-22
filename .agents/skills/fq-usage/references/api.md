@@ -5,7 +5,9 @@
 ```go
 type FileQueue interface {
 	Push(ctx context.Context, qID uint8, data []byte) error
+	PushN(ctx context.Context, qID uint8, items [][]byte) (int, error)
 	Pop(ctx context.Context, qID uint8) ([]byte, error)
+	PopN(ctx context.Context, qID uint8, n int) ([][]byte, error)
 	Stats() []QueueStats
 	Close(ctx context.Context)
 }
@@ -64,11 +66,11 @@ func New(p Params) (FileQueue, error)
 
 | Constant | String Value | Trigger |
 | :--- | :--- | :--- |
-| `ErrEmpty` | `"fq: queue is empty"` | `Pop` when no unread items remain |
-| `ErrNil` | `"fq: queue is nil"` | `Push`/`Pop` with unconfigured `qID` |
-| `ErrClosed` | `"fq: queue is closed"` | `Push`/`Pop` after `Close` |
-| `ErrEmptyData` | `"fq: payload cannot be empty"` | `Push` with `len(data) == 0` |
-| `ErrPayloadTooLarge` | `"fq: payload exceeds maximum size"` | `Push` with `len(data) > 16,777,215` |
+| `ErrEmpty` | `"fq: queue is empty"` | `Pop` (or `PopN` when zero items remain) |
+| `ErrNil` | `"fq: queue is nil"` | `Push`/`PushN`/`Pop`/`PopN` with unconfigured `qID` |
+| `ErrClosed` | `"fq: queue is closed"` | `Push`/`PushN`/`Pop`/`PopN` after `Close` |
+| `ErrEmptyData` | `"fq: payload cannot be empty"` | `Push`/`PushN` with `len(data) == 0` |
+| `ErrPayloadTooLarge` | `"fq: payload exceeds maximum size"` | `Push`/`PushN` with `len(data) > 16,777,215` |
 | `ErrInvalidConfig` | `"fq: invalid configuration"` | Invalid `Path`, `MaxFileSize`, `PersistInterval`, or duplicate/unsafe queue `ID`/`Name` |
 | `ErrInvalidMetadataSize` | `"fq: invalid metadata size"` | `<name>.bin` is not exactly 16 bytes |
 | `ErrFileRead` | `"fq: failed reading from file"` | Partition `ReadAt` failure |

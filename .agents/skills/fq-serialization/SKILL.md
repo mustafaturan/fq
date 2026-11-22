@@ -10,7 +10,7 @@ description: >-
 
 # High-Performance Serialization for `fq`
 
-`fq.Push` runs at `0 allocs/op` and `fq.Pop` serves sequential small reads from a 64 KiB read-ahead buffer (~37 ns/op for 64 B payloads). Reflection-heavy encoders (`encoding/json`, `encoding/gob`) easily become 10×–100× slower than `fq` itself and bloat partition files.
+`fq.Push` and `fq.PushN` run at `0 allocs/op`, and `fq.Pop`/`fq.PopN` serve sequential small reads from a 64 KiB read-ahead buffer (~33–41 ns/item for 64 B payloads). Reflection-heavy encoders (`encoding/json`, `encoding/gob`) easily become 10×–100× slower than `fq` itself and bloat partition files.
 
 ## Choosing a Codec
 
@@ -30,7 +30,7 @@ description: >-
 1. **Always version payloads**: Persisted `fq` records survive binary deployments. Start custom binary codecs with a `uint8` version byte so new binaries can drain older records safely.
 2. **Implement `encoding.BinaryAppender` (`AppendBinary`) for buffer reuse**: Because `fq.Push` writes synchronously and never retains `data`, reuse a per-worker or `sync.Pool` slice (`buf = buf[:0]`) for zero-allocation publishing.
 3. **Bounds-check every slice index on decode**: Validate minimum header length, version byte, and variable-length bounds before slicing so corrupt payloads return an error instead of panicking.
-4. **Slice variable `[]byte` fields directly from `Pop`'s output**: `fq.Pop` returns a freshly allocated slice owned exclusively by the caller, so zero-copy slicing inside `UnmarshalBinary` is safe.
+4. **Slice variable `[]byte` fields directly from `Pop`/`PopN` output**: `fq.Pop` returns a freshly allocated slice owned exclusively by the caller, and `fq.PopN` returns append-safe 3-index slices (`cap == len`) from 32 KiB slabs. Zero-copy slicing inside `UnmarshalBinary` is safe; if retaining a decoded field from `PopN` long-term beyond the batch lifecycle, clone it (`bytes.Clone`) so the backing slab can be GC'd.
 5. **Stay within `fq`'s payload limit**: Single payloads must be non-empty and `<= 16,777,215` bytes (`(1 << 24) - 1`).
 
 ## Reference `encoding/binary` Pattern

@@ -4,7 +4,7 @@ Guidelines for coding agents working in `github.com/mustafaturan/fq` and instruc
 
 ## Repository Architecture
 
-- [fq.go](./fq.go) — Core `FileQueue` implementation (`New`, `Push`, `Pop`, `Stats`, `Close`), atomic metadata persistence (`<name>.bin`), partition rollover (`<name>.db<N>`), 64 KiB scratch/read-ahead buffers, and `Logger` interface.
+- [fq.go](./fq.go) — Core `FileQueue` implementation (`New`, `Push`, `PushN`, `Pop`, `PopN`, `Stats`, `Close`), atomic metadata persistence (`<name>.bin`), partition rollover (`<name>.db<N>`), 64 KiB scratch/read-ahead buffers, 32 KiB `PopN` slabs, and `Logger` interface.
 - [metrics.go](./metrics.go) — `QueueStats`, `PrometheusContentType`, and zero-dependency `WritePrometheus` text exporter.
 - [internal/fm/fm.go](./internal/fm/fm.go) — Internal `FileManager` implementing `io.ReaderAt`, `io.WriterAt`, `io.Closer`, `Sync`, and atomic `O_CREATE|O_EXCL` pre-allocation.
 - [fq_test.go](./fq_test.go), [fq_bench_test.go](./fq_bench_test.go), [internal/fm/fm_test.go](./internal/fm/fm_test.go) — Unit, concurrency/stress, and benchmark suites.

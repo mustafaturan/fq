@@ -4,7 +4,7 @@ description: >-
   Guides integration, configuration, operation, metrics export, and
   troubleshooting of the github.com/mustafaturan/fq disk-backed FIFO queue in
   Go applications. Use when adding fq to a Go project, configuring fq.Params or
-  YAML settings, implementing producers/consumers with Push/Pop/Stats/Close,
+  YAML settings, implementing producers/consumers with Push/PushN/Pop/PopN/Stats/Close,
   exposing Prometheus metrics via WritePrometheus, handling fq sentinel errors,
   tuning MaxFileSize/PersistInterval, or wiring slog/zerolog logging.
 ---
@@ -55,10 +55,11 @@ For complete type definitions, error tables, and on-disk binary layouts, read [r
 5. **Handle sentinel errors with `errors.Is`**:
    All exported errors are immutable `const` values of type `fq.Error` prefixed with `"fq: "`. Never compare errors with `==` across wrapped call chains; use `errors.Is`.
 
-## Producer Pattern (`Push`)
+## Producer Pattern (`Push` & `PushN`)
 
 - `Push` validates `ctx.Err()`, rejects empty slices (`fq.ErrEmptyData`), and rejects payloads larger than `16,777,215` bytes (`fq.ErrPayloadTooLarge`).
 - `Push` writes synchronously and **never retains** the caller's `data` slice, so producers can safely reuse a scratch buffer (`buf = buf[:0]`) across calls.
+- **`PushN(ctx, qID, items)`** validates all elements upfront, batches contiguous records up to 64 KiB into single `WriteAt` syscalls under one lock (`0 allocs/op`), and returns `(pushed, err)`. If an I/O error occurs mid-batch, `items[:pushed]` are already committed so callers can retry `items[pushed:]`.
 - For high-throughput struct encoding, also load the `fq-serialization` skill.
 
 ```go
@@ -70,9 +71,9 @@ if err := q.Push(ctx, queueEvents, payload); err != nil {
 }
 ```
 
-## Consumer Pattern (`Pop`)
+## Consumer Pattern (`Pop` & `PopN`)
 
-`Pop` is **non-blocking**, goroutine-safe, and returns `fq.ErrEmpty` when caught up. Every item is delivered to exactly one caller, so `N` concurrent workers can call `Pop` directly without a dispatcher channel. Drive idle workers with a buffered wake-up signal channel (notified non-blockingly after `Push`) plus a fallback ticker:
+`Pop` and `PopN` are **non-blocking**, goroutine-safe, and return `fq.ErrEmpty` when zero items remain. Every item is delivered to exactly one caller, so `N` concurrent workers can call `Pop` or `PopN` directly without a dispatcher channel. Drive idle workers with a buffered wake-up signal channel (notified non-blockingly after `Push`/`PushN`) plus a fallback ticker:
 
 ```go
 // Producer side: wake an idle consumer without blocking Push.
@@ -127,6 +128,7 @@ func runConsumers(
 
 - **Strict ordering vs. parallelism**: With `workers > 1`, items are dequeued in FIFO order while handlers run concurrently. For strict per-key ordering, shard across multiple `qID`s with 1 worker per `qID`.
 - **Buffer `notify` to `workers` (or `1`)**: Sizing `notify := make(chan struct{}, workers)` wakes multiple idle workers immediately during bursts.
+- **Batch popping with `PopN(ctx, qID, n)`**: Use `PopN` (e.g., `n = 32..256`) under heavy contention or for downstream bulk inserts/flushes. `PopN` returns partial batches with `err == nil` when fewer than `n` items exist, and returns any already-popped items alongside an error if a mid-batch I/O error occurs. Always process `len(batch) > 0` before handling `err`. Small payloads share 32 KiB slabs via append-safe 3-index slices (`cap == len`); copy an element if retaining it long-term outside the batch lifecycle.
 
 ## Configuration & Tuning
 
