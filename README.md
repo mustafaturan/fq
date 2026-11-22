@@ -381,18 +381,18 @@ func pushAndPopEvents(ctx context.Context, q fq.FileQueue, qID uint8) error {
 
 ## Benchmarks
 
-Measured on Apple M2 (`darwin/arm64`, Go 1.27.1, `go test -run='^$' -bench=. -benchmem -benchtime=250ms -count=3 .`, medians):
+Measured on Apple M2 (`darwin/arm64`, Go 1.27.4, `go test -run='^$' -bench=. -benchmem -benchtime=250ms -count=3 .`, medians):
 
 | Benchmark | Latency | Throughput | Memory | Allocs |
 | :--- | ---: | ---: | ---: | ---: |
-| `Push/64B` | `1212 ns/op` | `52.8 MB/s` | `0 B/op` | `0` |
-| `Push/1KiB` | `1662 ns/op` | `616 MB/s` | `0 B/op` | `0` |
-| `Push/128KiB` | `83.1 µs/op` | `1.58 GB/s` | `0 B/op` | `0` |
-| `Pop/64B` | `38.0 ns/op` | `1.68 GB/s` | `64 B/op` | `1` |
-| `Pop/1KiB` | `212.8 ns/op` | `4.81 GB/s` | `1024 B/op` | `1` |
-| `PushPop/64B` | `1607 ns/op` | `39.8 MB/s` | `64 B/op` | `1` |
-| `PushPop/1KiB` | `2304 ns/op` | `445 MB/s` | `1024 B/op` | `1` |
-| `PushPopParallel` | `2233 ns/op` | `28.7 MB/s` | `64 B/op` | `1` |
+| `Push/64B` | `1180 ns/op` | `54.3 MB/s` | `0 B/op` | `0` |
+| `Push/1KiB` | `1681 ns/op` | `609 MB/s` | `0 B/op` | `0` |
+| `Push/128KiB` | `79.7 µs/op` | `1.65 GB/s` | `0 B/op` | `0` |
+| `Pop/64B` | `40.4 ns/op` | `1.58 GB/s` | `64 B/op` | `1` |
+| `Pop/1KiB` | `214.0 ns/op` | `4.78 GB/s` | `1024 B/op` | `1` |
+| `PushPop/64B` | `1596 ns/op` | `40.1 MB/s` | `64 B/op` | `1` |
+| `PushPop/1KiB` | `2325 ns/op` | `440 MB/s` | `1024 B/op` | `1` |
+| `PushPopParallel` | `2188 ns/op` | `29.3 MB/s` | `64 B/op` | `1` |
 
 ## Development
 
